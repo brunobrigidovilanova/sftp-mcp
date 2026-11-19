@@ -199,11 +199,15 @@ async def test_chave_de_host_divergente_recusa(ops, perfil):
         await ops.listar(perfil.nome, "/")
 
 
-async def test_sem_repositorio_pede_para_perguntar(ops, perfil):
+async def test_sem_repositorio_le_mas_nao_baixa(ops, perfil, remoto):
     perfil.repositorio = ""
     config.salvar_perfil(perfil)
+    (remoto / "logs" / "a.txt").write_text("x")
+    assert (await ops.listar(perfil.nome, "/logs"))["total"] == 1
+    auditoria = config.diretorio_config() / "auditoria" / perfil.nome / "audit.log"
+    assert '"operacao": "listar"' in auditoria.read_text(encoding="utf-8")
     with pytest.raises(ErroRepositorio, match="Pergunte ao usuario"):
-        await ops.listar(perfil.nome, "/")
+        await ops.baixar(perfil.nome, "/logs/a.txt")
 
 
 async def test_vincular_repositorio(ops, perfil, tmp_path):
@@ -239,7 +243,7 @@ async def test_conexao_reaproveitada(ops, perfil, remoto):
 
 async def test_so_as_tools_de_escrita_exigem_aprovacao():
     ferramentas = {t.name: t for t in await server.mcp.list_tools()}
-    escrita = {"sftp_enviar", "sftp_criar_pasta", "sftp_renomear", "sftp_vincular_repositorio"}
+    escrita = {"sftp_enviar", "sftp_enviar_lote", "sftp_criar_pasta", "sftp_renomear", "sftp_vincular_repositorio"}
     for nome, ferramenta in ferramentas.items():
         exige = (ferramenta.meta or {}).get("anthropic/requiresUserInteraction") is True
         assert exige == (nome in escrita), nome

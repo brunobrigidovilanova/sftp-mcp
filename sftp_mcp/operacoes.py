@@ -7,20 +7,25 @@ e a checagem de raiz usa esse mesmo caminho. Assim symlink e '..' nao escapam da
 from __future__ import annotations
 
 import codecs
+import contextlib
 import datetime as dt
 import fnmatch
 import hashlib
+import json
 import posixpath
 import re
+import secrets
 import stat
+import time
 from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import asyncssh
 
-from . import armazenamento, config, credenciais
+from . import armazenamento, config, nomes
 from .armazenamento import ErroRepositorio
-from .conexao import ErroConexao, GerenciadorConexoes
+from .conexao import ErroConexao, GerenciadorConexoes, segredo_salvo
 from .config import ErroConfig, Perfil
 
 _BLOCO = 65_536
@@ -28,6 +33,17 @@ _AMOSTRA_BINARIO = 8_192
 # Barra invertida e separador para servidor SFTP sobre Windows: "a\..\..\x" escaparia
 # da raiz sem passar pelo realpath. Caractere invisivel mascararia o destino no prompt.
 _PROIBIDOS = re.compile("[\\\\\x00-\x1f\x7f​-‏‪-‮⁠-⁤⁦-⁩﻿]")
+
+
+# Itens devolvidos por listar/buscar quando o agente nao pede outro limite: pasta do Protheus
+# (system, spool) passa de mil itens e despejaria centenas de KB no contexto.
+LIMITE_PADRAO = 200
+ORDENS = ("nome", "modificado", "tamanho")
+# Busca e varredura de lote param aqui e devolvem o que acharam.
+TEMPO_MAX_VARREDURA = 60
+LOTE_MAX_ARQUIVOS = 500
+LOTE_MAX_BYTES = 500_000_000
+LOTE_MAX_ENVIO = 100
 
 
 class ErroOperacao(Exception):
@@ -40,12 +56,12 @@ ERROS_ESPERADOS = (ErroOperacao, ErroConfig, ErroConexao, ErroRepositorio)
 def _validar_caminho(caminho: str) -> str:
     if not caminho:
         raise ErroOperacao("Caminho remoto vazio.")
-    if _PROIBIDOS.search(caminho):
+    if _PROIBIDOS.search(nomes.sem_escapes(caminho)):
         raise ErroOperacao(
             "Caminho remoto com barra invertida ou caractere de controle/invisivel. "
-            "Use '/' como separador, inclusive em servidor Windows."
+            "Use '/' como separador, inclusive em servidor Windows. Byte que nao e UTF-8 vai como \\xHH."
         )
-    return posixpath.normpath(caminho)
+    return posixpath.normpath(nomes.ler(caminho))
 
 
 def _dentro(caminho: str, raizes: list[str], *, estrito: bool = False) -> bool:
@@ -144,6 +160,113 @@ def _mensagem_sftp(e: asyncssh.SFTPError, caminho: str) -> str:
     return f"Erro SFTP em {caminho}: {e.reason}"
 
 
+def _conferir_ordem_e_limite(ordenar: str, limite: int | None) -> None:
+    if ordenar not in ORDENS:
+        raise ErroOperacao(f"ordenar deve ser {', '.join(ORDENS)}.")
+    if limite is not None and limite < 1:
+        raise ErroOperacao("limite comeca em 1.")
+
+
+def _ordenados(itens: list[tuple[str, asyncssh.SFTPAttrs]], ordenar: str, *, pastas_primeiro: bool) -> list:
+    """modificado e tamanho: maior primeiro (o log mais recente, o arquivo maior)."""
+    if ordenar == "modificado":
+        return sorted(itens, key=lambda i: i[1].mtime or 0, reverse=True)
+    if ordenar == "tamanho":
+        return sorted(itens, key=lambda i: i[1].size or 0, reverse=True)
+    if pastas_primeiro:
+        return sorted(itens, key=lambda i: (_tipo(i[1]) != "pasta", i[0].lower()))
+    return sorted(itens, key=lambda i: i[0].lower())
+
+
+@dataclass
+class _Varredura:
+    achados: list = field(default_factory=list)
+    sem_acesso: list = field(default_factory=list)
+    com_erro: list = field(default_factory=list)
+    truncado: bool = False
+    interrompido: bool = False
+
+
+async def _varrer(sftp, raiz: str, profundidade: int, aceitar, max_achados: int) -> _Varredura:
+    """Desce em largura ate a profundidade, sem seguir link de pasta (evita laco e saida da raiz)."""
+    v = _Varredura()
+    prazo = time.monotonic() + TEMPO_MAX_VARREDURA
+    fila = deque([(raiz, 1)])
+    while fila and not v.truncado:
+        if time.monotonic() > prazo:
+            v.interrompido = True
+            break
+        pasta, nivel = fila.popleft()
+        try:
+            itens = await sftp.readdir(pasta)
+        except (asyncssh.SFTPNoSuchFile, asyncssh.SFTPPermissionDenied):
+            v.sem_acesso.append(pasta)
+            continue
+        except (asyncssh.SFTPConnectionLost, asyncssh.SFTPNoConnection):
+            raise
+        except asyncssh.SFTPError as e:
+            v.com_erro.append({"pasta": pasta, "erro": str(e) or type(e).__name__})
+            continue
+        for item in itens:
+            if item.filename in (".", ".."):
+                continue
+            completo = posixpath.join(pasta, item.filename)
+            tipo_item = _tipo(item.attrs)
+            if tipo_item == "pasta" and nivel < profundidade:
+                fila.append((completo, nivel + 1))
+            if not aceitar(item.filename, tipo_item):
+                continue
+            if len(v.achados) >= max_achados:
+                v.truncado = True
+                break
+            v.achados.append((completo, item.attrs))
+    return v
+
+
+async def _baixar_um(sftp, remoto: str, destino: Path) -> tuple[int, str]:
+    try:
+        await sftp.get(remoto, str(destino))
+    except BaseException:
+        destino.unlink(missing_ok=True)  # nao deixa download pela metade
+        raise
+    return destino.stat().st_size, _sha256(destino)
+
+
+class _DestinoApagado(ErroOperacao):
+    """A troca apagou o destino e nao conseguiu por o novo no lugar: o temporario nao pode sumir."""
+
+
+async def _substituir(sftp, temporario: str, real: str, backup) -> None:
+    try:
+        await sftp.posix_rename(temporario, real)
+    except asyncssh.SFTPOpUnsupported:
+        # Servidor sem posix-rename: a versao anterior ja esta em backups/.
+        await sftp.remove(real)
+        try:
+            await sftp.rename(temporario, real)
+        except asyncssh.SFTPError as e:
+            raise _DestinoApagado(
+                f"{real} foi apagado para a troca, mas renomear falhou ({e}). O conteudo novo ficou em "
+                f"{temporario} e a versao anterior em {backup}."
+            ) from None
+
+
+def _arquivo_local(texto: str) -> Path:
+    origem = Path(texto).expanduser()
+    if not origem.is_file():
+        raise ErroOperacao(f"Arquivo local nao existe ou nao e arquivo: {origem}")
+    return origem
+
+
+def _conferir_destino(real: str, atual: asyncssh.SFTPAttrs | None, sobrescrever: bool) -> None:
+    if atual is None:
+        return
+    if _tipo(atual) != "arquivo":
+        raise ErroOperacao(f"{real} existe e nao e arquivo regular ({_tipo(atual)}). Nada enviado.")
+    if not sobrescrever:
+        raise ErroOperacao(f"{real} ja existe. Para substituir, chame de novo com sobrescrever=true.")
+
+
 class Operacoes:
     def __init__(self, gerenciador: GerenciadorConexoes) -> None:
         self._gerenciador = gerenciador
@@ -151,10 +274,11 @@ class Operacoes:
     # ------------------------------------------------------------------
     # Apoio
 
-    def _perfil(self, nome_perfil: str) -> Perfil:
+    def _perfil(self, nome_perfil: str, *, exige_repositorio: bool = False) -> Perfil:
         perfil = config.obter_perfil(nome_perfil)
-        # A pasta local e conferida antes de conectar: sem ela nao ha onde auditar.
-        armazenamento.pasta_perfil(perfil)
+        # Download, backup e escrita ficam no repositorio do cliente: conferido antes de conectar.
+        if exige_repositorio:
+            armazenamento.pasta_perfil(perfil)
         return perfil
 
     async def _auditado(self, perfil: Perfil, operacao: str, dados: dict, executar):
@@ -268,49 +392,66 @@ class Operacoes:
 
     def perfis(self) -> list[dict]:
         lista = []
-        for perfil in config.carregar_perfis().values():
-            tipo_segredo = "senha" if perfil.autenticacao == "senha" else "passphrase"
+        perfis, ignorados = config.carregar_com_ignorados()
+        for perfil in perfis.values():
+            try:
+                tem_segredo = bool(segredo_salvo(perfil))
+            except ErroConexao:
+                tem_segredo = False
             lista.append({
                 "perfil": perfil.nome,
+                "origem": perfil.origem,
                 "host": perfil.host,
                 "porta": perfil.porta,
                 "usuario": perfil.usuario,
                 "ambiente": perfil.ambiente,
                 "tspace_cliente": perfil.tspace_cliente,
                 "autenticacao": perfil.autenticacao,
-                "segredo_cadastrado": bool(credenciais.obter(perfil.nome, tipo_segredo)),
+                "segredo_cadastrado": tem_segredo,
                 "repositorio": perfil.repositorio,
                 "repositorio_existe": bool(perfil.repositorio) and Path(perfil.repositorio).is_dir(),
                 "raizes_leitura": perfil.raizes_leitura,
                 "raizes_escrita": perfil.raizes_escrita,
             })
+        lista += [
+            {"perfil": i["perfil"], "origem": i["origem"], "indisponivel": i["motivo"]} for i in ignorados
+        ]
         return lista
 
-    async def listar(self, nome_perfil: str, caminho: str = ".", padrao: str | None = None) -> dict:
+    async def listar(
+        self,
+        nome_perfil: str,
+        caminho: str = ".",
+        padrao: str | None = None,
+        ordenar: str = "nome",
+        limite: int | None = None,
+    ) -> dict:
+        _conferir_ordem_e_limite(ordenar, limite)
         perfil = self._perfil(nome_perfil)
+        maximo = min(limite or LIMITE_PADRAO, perfil.busca_max_resultados)
 
         async def executar(sftp):
             real, attrs = await self._stat_leitura(perfil, sftp, caminho)
             if _tipo(attrs) != "pasta":
                 raise ErroOperacao(f"{real} nao e pasta. Use sftp_info ou sftp_ler.")
+            itens = [
+                (item.filename, item.attrs)
+                for item in await sftp.readdir(real)
+                if item.filename not in (".", "..")
+                and (not padrao or fnmatch.fnmatch(item.filename.lower(), padrao.lower()))
+            ]
+            itens = _ordenados(itens, ordenar, pastas_primeiro=True)
             entradas = []
-            truncado = False
-            for item in await sftp.readdir(real):
-                if item.filename in (".", ".."):
-                    continue
-                if padrao and not fnmatch.fnmatch(item.filename.lower(), padrao.lower()):
-                    continue
-                if len(entradas) >= perfil.busca_max_resultados:
-                    truncado = True
-                    break
-                entrada = _descrever(item.filename, item.attrs)
+            for nome, item_attrs in itens[:maximo]:
+                entrada = _descrever(nome, item_attrs)
                 entrada["nome"] = entrada.pop("caminho")
                 entradas.append(entrada)
-            entradas.sort(key=lambda e: (e["tipo"] != "pasta", e["nome"].lower()))
             return {
                 "caminho": real,
+                "ordenado_por": ordenar,
+                "total": len(itens),
                 "entradas": entradas,
-                "truncado": truncado,
+                "truncado": len(itens) > len(entradas),
                 "_auditoria": {"itens": len(entradas)},
             }
 
@@ -442,70 +583,58 @@ class Operacoes:
         padrao: str = "*",
         tipo: str = "qualquer",
         profundidade: int | None = None,
+        ordenar: str = "nome",
+        limite: int | None = None,
     ) -> dict:
         if tipo not in ("qualquer", "arquivo", "pasta"):
             raise ErroOperacao("tipo deve ser qualquer, arquivo ou pasta.")
+        _conferir_ordem_e_limite(ordenar, limite)
         perfil = self._perfil(nome_perfil)
         limite_profundidade = min(profundidade or perfil.busca_profundidade, perfil.busca_profundidade)
+        maximo = min(limite or LIMITE_PADRAO, perfil.busca_max_resultados)
+
+        def aceitar(nome: str, tipo_item: str) -> bool:
+            return (tipo == "qualquer" or tipo_item == tipo) and fnmatch.fnmatch(nome.lower(), padrao.lower())
 
         async def executar(sftp):
             real, attrs = await self._stat_leitura(perfil, sftp, caminho)
             if _tipo(attrs) != "pasta":
                 raise ErroOperacao(f"{real} nao e pasta.")
-            achados = []
-            sem_acesso = []
-            truncado = False
-            fila = deque([(real, 1)])
-            while fila and not truncado:
-                pasta, nivel = fila.popleft()
-                try:
-                    itens = await sftp.readdir(pasta)
-                except (asyncssh.SFTPNoSuchFile, asyncssh.SFTPPermissionDenied):
-                    sem_acesso.append(pasta)
-                    continue
-                for item in itens:
-                    if item.filename in (".", ".."):
-                        continue
-                    completo = posixpath.join(pasta, item.filename)
-                    tipo_item = _tipo(item.attrs)
-                    # Link para pasta nao e seguido: evita laco e saida da raiz.
-                    if tipo_item == "pasta" and nivel < limite_profundidade:
-                        fila.append((completo, nivel + 1))
-                    if tipo != "qualquer" and tipo_item != tipo:
-                        continue
-                    if not fnmatch.fnmatch(item.filename.lower(), padrao.lower()):
-                        continue
-                    if len(achados) >= perfil.busca_max_resultados:
-                        truncado = True
-                        break
-                    achados.append(_descrever(completo, item.attrs))
+            v = await _varrer(sftp, real, limite_profundidade, aceitar, perfil.busca_max_resultados)
+            achados = _ordenados(v.achados, ordenar, pastas_primeiro=False)
+            resultados = [_descrever(c, a) for c, a in achados[:maximo]]
             return {
                 "caminho": real,
                 "padrao": padrao,
                 "profundidade": limite_profundidade,
-                "resultados": achados,
-                "truncado": truncado,
-                "pastas_sem_acesso": sem_acesso,
-                "_auditoria": {"padrao": padrao, "itens": len(achados)},
+                "ordenado_por": ordenar,
+                "total_encontrado": len(achados),
+                "resultados": resultados,
+                "truncado": v.truncado or len(achados) > len(resultados),
+                "interrompido_por_tempo": v.interrompido,
+                # Busca truncada ou interrompida: a ordem vale so para o que foi achado.
+                "ordenacao_parcial": v.truncado or v.interrompido,
+                "pastas_sem_acesso": v.sem_acesso,
+                "pastas_com_erro": v.com_erro,
+                "_auditoria": {"padrao": padrao, "itens": len(resultados)},
             }
 
         return await self._auditado(perfil, "buscar", {"caminho": caminho}, executar)
 
-    async def baixar(self, nome_perfil: str, caminho: str) -> dict:
-        perfil = self._perfil(nome_perfil)
+    async def baixar(
+        self, nome_perfil: str, caminho: str, padrao: str | None = None, profundidade: int | None = None
+    ) -> dict:
+        perfil = self._perfil(nome_perfil, exige_repositorio=True)
+        limite_profundidade = min(profundidade or perfil.busca_profundidade, perfil.busca_profundidade)
 
         async def executar(sftp):
             real, attrs = await self._stat_leitura(perfil, sftp, caminho)
+            if _tipo(attrs) == "pasta":
+                return await self._baixar_pasta(perfil, sftp, real, padrao or "*", limite_profundidade)
             if _tipo(attrs) != "arquivo":
-                raise ErroOperacao(f"{real} nao e arquivo regular. Baixe arquivo por arquivo.")
+                raise ErroOperacao(f"{real} nao e arquivo regular nem pasta.")
             destino = armazenamento.destino_download(perfil, real)
-            try:
-                await sftp.get(real, str(destino))
-            except BaseException:
-                destino.unlink(missing_ok=True)  # nao deixa download pela metade
-                raise
-            sha = _sha256(destino)
-            tamanho = destino.stat().st_size
+            tamanho, sha = await _baixar_um(sftp, real, destino)
             return {
                 "caminho_remoto": real,
                 "arquivo_local": str(destino),
@@ -516,62 +645,221 @@ class Operacoes:
 
         return await self._auditado(perfil, "baixar", {"caminho": caminho}, executar)
 
+    async def _baixar_pasta(self, perfil: Perfil, sftp, real: str, padrao: str, profundidade: int) -> dict:
+        def aceitar(nome: str, tipo_item: str) -> bool:
+            return tipo_item == "arquivo" and fnmatch.fnmatch(nome.lower(), padrao.lower())
+
+        v = await _varrer(sftp, real, profundidade, aceitar, LOTE_MAX_ARQUIVOS)
+        if v.interrompido:
+            raise ErroOperacao(
+                f"A varredura de {real} passou de {TEMPO_MAX_VARREDURA} s. Restrinja com padrao ou profundidade."
+            )
+        if v.truncado:
+            raise ErroOperacao(
+                f"{real} tem mais de {LOTE_MAX_ARQUIVOS} arquivos com o padrao {padrao!r}. "
+                "Filtre com padrao ou profundidade, ou baixe por subpasta. Nada foi baixado."
+            )
+        total = sum(a.size or 0 for _, a in v.achados)
+        if total > LOTE_MAX_BYTES:
+            raise ErroOperacao(
+                f"O lote soma {total / 1e6:.0f} MB, acima do limite de {LOTE_MAX_BYTES // 1_000_000} MB. "
+                "Filtre com padrao ou baixe por subpasta. Nada foi baixado."
+            )
+        resumo = {
+            "caminho_remoto": real,
+            "padrao": padrao,
+            "pastas_sem_acesso": v.sem_acesso,
+            "pastas_com_erro": v.com_erro,
+        }
+        if not v.achados:
+            return {**resumo, "arquivos": 0, "_auditoria": {"arquivos": 0}}
+        lote = armazenamento.nova_pasta_lote(perfil)
+        # Reservado antes: um manifesto.json vindo do servidor ganha sufixo em vez de ser sobrescrito.
+        arquivo_manifesto = armazenamento.destino_no_lote(lote, "manifesto.json")
+        base = posixpath.dirname(real.rstrip("/")) or "/"
+        manifesto, falhas = [], []
+        for remoto, _attrs in sorted(v.achados):
+            destino = armazenamento.destino_no_lote(lote, posixpath.relpath(remoto, base))
+            try:
+                tamanho, sha = await _baixar_um(sftp, remoto, destino)
+            except (asyncssh.SFTPConnectionLost, asyncssh.SFTPNoConnection):
+                raise
+            except asyncssh.SFTPError as e:
+                falhas.append({"caminho": remoto, "erro": _mensagem_sftp(e, remoto)})
+                continue
+            manifesto.append({
+                "remoto": remoto, "local": destino.relative_to(lote).as_posix(), "tamanho": tamanho, "sha256": sha,
+            })
+        arquivo_manifesto.write_text(
+            json.dumps(nomes.sanear({**resumo, "arquivos": manifesto, "falhas": falhas}), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        baixados = sum(m["tamanho"] for m in manifesto)
+        return {
+            **resumo,
+            "pasta_local": str(lote),
+            "arquivos": len(manifesto),
+            "bytes": baixados,
+            "falhas": falhas,
+            "manifesto": str(arquivo_manifesto),
+            "amostra": [m["local"] for m in manifesto[:20]],
+            "_auditoria": {"lote": str(lote), "arquivos": len(manifesto), "bytes": baixados, "falhas": len(falhas)},
+        }
+
     # ------------------------------------------------------------------
     # Escrita (as tools exigem aprovacao do usuario em toda chamada)
+
+    async def _enviar_um(self, perfil: Perfil, sftp, origem: Path, real: str, atual) -> dict:
+        backup = None
+        if atual is not None:
+            backup = armazenamento.destino_backup(perfil, real)
+            try:
+                await sftp.get(real, str(backup))
+            except BaseException:
+                backup.unlink(missing_ok=True)
+                raise
+        tamanho = origem.stat().st_size
+        sha = _sha256(origem)
+        # Grava num temporario da mesma pasta e troca no fim: queda no meio nao deixa o destino pela metade.
+        temporario = posixpath.join(
+            posixpath.dirname(real), f".{posixpath.basename(real)}.sftp-mcp-{secrets.token_hex(4)}.tmp"
+        )
+        direto = False
+        try:
+            await sftp.put(str(origem), temporario)
+        except asyncssh.SFTPPermissionDenied:
+            if atual is None:
+                raise
+            # Pasta sem permissao de criar arquivo, mas destino gravavel: grava direto nele, como o original.
+            with contextlib.suppress(Exception):
+                await sftp.remove(temporario)
+            await sftp.put(str(origem), real)
+            direto = True
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await sftp.remove(temporario)
+            raise
+        if direto:
+            enviado = await sftp.stat(real)
+            if enviado.size != tamanho:
+                raise ErroOperacao(
+                    f"Tamanho no servidor ({enviado.size}) difere do local ({tamanho}) em {real}. "
+                    f"Versao anterior salva em {backup}."
+                )
+        else:
+            try:
+                enviado = await sftp.stat(temporario)
+                if enviado.size != tamanho:
+                    raise ErroOperacao(
+                        f"Tamanho no servidor ({enviado.size}) difere do local ({tamanho}) em {real}. "
+                        "O arquivo de destino nao foi tocado."
+                    )
+                if atual is None:
+                    await sftp.rename(temporario, real)
+                else:
+                    # O arquivo novo nasce com o modo padrao do servidor: mantem o do arquivo substituido.
+                    if atual.permissions is not None:
+                        with contextlib.suppress(asyncssh.SFTPError):
+                            await sftp.chmod(temporario, stat.S_IMODE(atual.permissions))
+                    await _substituir(sftp, temporario, real, backup)
+            except _DestinoApagado:
+                raise
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await sftp.remove(temporario)
+                raise
+        return {
+            "caminho_remoto": real,
+            "arquivo_local": str(origem),
+            "tamanho": tamanho,
+            "sha256": sha,
+            "sobrescreveu": backup is not None,
+            "backup_local": str(backup) if backup else None,
+            "envio_direto": direto,
+        }
 
     async def enviar(
         self, nome_perfil: str, arquivo_local: str, caminho_remoto: str, sobrescrever: bool = False
     ) -> dict:
-        origem = Path(arquivo_local).expanduser()
-        if not origem.is_file():
-            raise ErroOperacao(f"Arquivo local nao existe ou nao e arquivo: {origem}")
-        perfil = self._perfil(nome_perfil)
+        origem = _arquivo_local(arquivo_local)
+        perfil = self._perfil(nome_perfil, exige_repositorio=True)
 
         async def executar(sftp):
             alvo = caminho_remoto + origem.name if caminho_remoto.endswith("/") else caminho_remoto
             real = await self._resolver_novo(sftp, alvo)
             atual = await self._lstat(sftp, real)
             if atual is not None and _tipo(atual) == "pasta":
+                _validar_caminho(origem.name)
                 real = posixpath.join(real, origem.name)
                 atual = await self._lstat(sftp, real)
             await self._checar_escrita(perfil, sftp, real, estrito=True)
-            backup = None
-            if atual is not None:
-                if _tipo(atual) != "arquivo":
-                    raise ErroOperacao(f"{real} existe e nao e arquivo regular ({_tipo(atual)}). Nada enviado.")
-                if not sobrescrever:
-                    raise ErroOperacao(f"{real} ja existe. Para substituir, chame de novo com sobrescrever=true.")
-                backup = armazenamento.destino_backup(perfil, real)
-                try:
-                    await sftp.get(real, str(backup))
-                except BaseException:
-                    backup.unlink(missing_ok=True)
-                    raise
-            tamanho = origem.stat().st_size
-            sha = _sha256(origem)
-            await sftp.put(str(origem), real)
-            enviado = await sftp.stat(real)
-            if enviado.size != tamanho:
-                raise ErroOperacao(
-                    f"Tamanho no servidor ({enviado.size}) difere do local ({tamanho}) em {real}. "
-                    + (f"Versao anterior salva em {backup}." if backup else "")
-                )
-            dados = {
-                "caminho_remoto": real,
-                "arquivo_local": str(origem),
-                "tamanho": tamanho,
-                "sha256": sha,
-                "sobrescreveu": backup is not None,
-                "backup_local": str(backup) if backup else None,
-            }
+            _conferir_destino(real, atual, sobrescrever)
+            dados = await self._enviar_um(perfil, sftp, origem, real, atual)
             return {**dados, "_auditoria": dict(dados)}
 
         return await self._auditado(
             perfil, "enviar", {"caminho": caminho_remoto, "sobrescrever": sobrescrever}, executar
         )
 
+    async def enviar_lote(
+        self, nome_perfil: str, arquivos_locais: list[str], pasta_remota: str, sobrescrever: bool = False
+    ) -> dict:
+        if not arquivos_locais:
+            raise ErroOperacao("Informe ao menos um arquivo local.")
+        if len(arquivos_locais) > LOTE_MAX_ENVIO:
+            raise ErroOperacao(f"No maximo {LOTE_MAX_ENVIO} arquivos por lote.")
+        origens = [_arquivo_local(a) for a in arquivos_locais]
+        for origem in origens:
+            _validar_caminho(origem.name)
+        nomes_locais = [o.name for o in origens]
+        repetidos = sorted({n for n in nomes_locais if nomes_locais.count(n) > 1})
+        if repetidos:
+            raise ErroOperacao(f"Nomes repetidos no lote: {', '.join(repetidos)}. Envie em lotes separados.")
+        perfil = self._perfil(nome_perfil, exige_repositorio=True)
+
+        async def executar(sftp):
+            pasta_real = await self._resolver_existente(sftp, pasta_remota)
+            try:
+                attrs = await sftp.stat(pasta_real)
+            except asyncssh.SFTPError as e:
+                raise ErroOperacao(_mensagem_sftp(e, pasta_real)) from None
+            if _tipo(attrs) != "pasta":
+                raise ErroOperacao(f"{pasta_real} nao e pasta.")
+            # Confere todos os destinos antes de enviar o primeiro: conflito nao deixa lote pela metade.
+            planos = []
+            for origem in origens:
+                real = posixpath.join(pasta_real, origem.name)
+                await self._checar_escrita(perfil, sftp, real, estrito=True)
+                atual = await self._lstat(sftp, real)
+                _conferir_destino(real, atual, sobrescrever)
+                planos.append((origem, real, atual))
+            enviados = []
+            for origem, real, atual in planos:
+                try:
+                    enviados.append(await self._enviar_um(perfil, sftp, origem, real, atual))
+                except Exception as e:
+                    motivo = _mensagem_sftp(e, real) if isinstance(e, asyncssh.SFTPError) else str(e)
+                    feitos = "; ".join(
+                        d["caminho_remoto"] + (f" (backup em {d['backup_local']})" if d["backup_local"] else "")
+                        for d in enviados
+                    ) or "nenhum"
+                    raise ErroOperacao(
+                        f"Falhou em {real}: {motivo or type(e).__name__}. Enviados antes da falha: {feitos}."
+                    ) from None
+            return {
+                "pasta_remota": pasta_real,
+                "enviados": enviados,
+                "_auditoria": {"enviados": [{k: d[k] for k in ("caminho_remoto", "sha256", "sobrescreveu")}
+                                            for d in enviados]},
+            }
+
+        return await self._auditado(
+            perfil, "enviar_lote",
+            {"caminho": pasta_remota, "arquivos": nomes_locais, "sobrescrever": sobrescrever}, executar,
+        )
+
     async def criar_pasta(self, nome_perfil: str, caminho: str, criar_pais: bool = False) -> dict:
-        perfil = self._perfil(nome_perfil)
+        perfil = self._perfil(nome_perfil, exige_repositorio=True)
 
         async def executar(sftp):
             if criar_pais:
@@ -590,7 +878,7 @@ class Operacoes:
         return await self._auditado(perfil, "criar_pasta", {"caminho": caminho}, executar)
 
     async def renomear(self, nome_perfil: str, origem: str, destino: str) -> dict:
-        perfil = self._perfil(nome_perfil)
+        perfil = self._perfil(nome_perfil, exige_repositorio=True)
 
         async def executar(sftp):
             # A origem nao segue o ultimo link: renomear um link mexe so no link.

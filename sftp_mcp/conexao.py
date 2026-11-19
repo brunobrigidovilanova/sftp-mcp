@@ -10,8 +10,8 @@ from dataclasses import dataclass
 
 import asyncssh
 
-from . import credenciais
-from .config import Perfil
+from . import credenciais, filezilla
+from .config import ORIGEM_FILEZILLA, Perfil, nome_segredo
 
 # Erros que indicam canal SFTP ou conexao SSH perdidos: a entrada do cache e descartada.
 _ERROS_DE_CONEXAO = (
@@ -21,6 +21,13 @@ _ERROS_DE_CONEXAO = (
     asyncssh.DisconnectError,
     ConnectionError,
 )
+
+
+# Com chacha20 na proposta, o gateway SSH-2.0-Pandora do TCloud derruba o login com
+# "Max packet size exceeded", mesmo negociando AES-GCM.
+_CIFRAS = [
+    a.decode("ascii") for a in asyncssh.encryption.get_default_encryption_algs() if not a.startswith(b"chacha20")
+]
 
 
 class ErroConexao(Exception):
@@ -47,6 +54,20 @@ async def chave_do_servidor(host: str, porta: int, timeout: int = 15) -> str:
     return chave.export_public_key("openssh").decode("ascii").strip()
 
 
+def segredo_salvo(perfil: Perfil) -> str | None:
+    """Senha (FileZilla e depois keyring) ou passphrase (keyring). Nunca devolver ao modelo."""
+    if perfil.autenticacao != "senha":
+        return credenciais.obter(nome_segredo(perfil), "passphrase")
+    if perfil.origem == ORIGEM_FILEZILLA:
+        try:
+            senha = filezilla.senha(perfil.host, perfil.porta, perfil.usuario)
+        except filezilla.ErroFileZilla as e:
+            raise ErroConexao(str(e)) from e
+        if senha:
+            return senha
+    return credenciais.obter(nome_segredo(perfil), "senha")
+
+
 def _opcoes_conexao(perfil: Perfil, segredo: str | None = None) -> asyncssh.SSHClientConnectionOptions:
     """segredo em memoria tem prioridade sobre o keyring: o cadastro testa o login antes de gravar."""
     opcoes = dict(
@@ -59,11 +80,18 @@ def _opcoes_conexao(perfil: Perfil, segredo: str | None = None) -> asyncssh.SSHC
         config=None,
         gss_auth=False,
         gss_kex=False,
+        encryption_algs=_CIFRAS,
         connect_timeout=perfil.timeout_conexao,
         keepalive_interval=60,
     )
     if perfil.autenticacao == "senha":
-        senha = segredo or credenciais.obter(perfil.nome, "senha")
+        senha = segredo or segredo_salvo(perfil)
+        if not senha and perfil.origem == ORIGEM_FILEZILLA:
+            raise ErroConexao(
+                f"Perfil {perfil.nome} sem senha salva no FileZilla (senha mestra do FileZilla nao e lida). "
+                "Peca ao usuario para salvar a senha na conexao do FileZilla, ou para rodar: "
+                f"sftp-mcp-setup definir-senha {perfil.nome}"
+            )
         if not senha:
             raise ErroConexao(
                 f"Perfil {perfil.nome} sem senha no Credential Manager. "
@@ -73,7 +101,7 @@ def _opcoes_conexao(perfil: Perfil, segredo: str | None = None) -> asyncssh.SSHC
     else:
         opcoes.update(
             client_keys=[perfil.chave_privada],
-            passphrase=segredo or credenciais.obter(perfil.nome, "passphrase"),
+            passphrase=segredo or segredo_salvo(perfil),
             password=None,
         )
     resultado = asyncssh.SSHClientConnectionOptions(**opcoes)
@@ -83,12 +111,20 @@ def _opcoes_conexao(perfil: Perfil, segredo: str | None = None) -> asyncssh.SSHC
     return resultado
 
 
+def _destino(perfil: Perfil) -> tuple:
+    return (
+        perfil.host, perfil.porta, perfil.usuario, perfil.host_key, perfil.autenticacao,
+        perfil.chave_privada, perfil.pasta_inicial,
+    )
+
+
 @dataclass
 class _Conexao:
     conexao: asyncssh.SSHClientConnection
     sftp: asyncssh.SFTPClient
     ultimo_uso: float
     ocioso_max: int
+    destino: tuple = ()
     em_uso: int = 0
 
     def morta(self) -> bool:
@@ -112,7 +148,8 @@ class GerenciadorConexoes:
         trava = self._travas.setdefault(perfil.nome, asyncio.Lock())
         async with trava:
             atual = self._conexoes.get(perfil.nome)
-            if atual is None or atual.morta():
+            # O perfil do FileZilla e relido a cada chamada: servidor trocado la exige conexao nova.
+            if atual is None or atual.morta() or atual.destino != _destino(perfil):
                 if atual is not None:
                     self._descartar(perfil.nome)
                 atual = await self._conectar(perfil, segredo)
@@ -131,10 +168,14 @@ class GerenciadorConexoes:
         try:
             conexao = await asyncssh.connect(perfil.host, perfil.porta, options=_opcoes_conexao(perfil, segredo))
         except asyncssh.HostKeyNotVerifiable as e:
+            confirmar = (
+                "aceitando a chave nova ao conectar pelo FileZilla" if perfil.origem == ORIGEM_FILEZILLA
+                else f"sftp-mcp-setup trocar-fingerprint {perfil.nome}"
+            )
             raise ErroConexao(
                 f"A chave do servidor {perfil.host}:{perfil.porta} nao confere com a fixada no perfil "
                 f"{perfil.nome} ({fingerprint(perfil.host_key)}). Conexao recusada. Se a troca for "
-                f"legitima, o usuario confirma com: sftp-mcp-setup trocar-fingerprint {perfil.nome}"
+                f"legitima, o usuario confirma {confirmar}."
             ) from e
         except asyncssh.PermissionDenied as e:
             raise ErroConexao(f"Autenticacao recusada pelo servidor do perfil {perfil.nome}.") from e
@@ -144,7 +185,8 @@ class GerenciadorConexoes:
                 "Se o cliente exige VPN, confira se ela esta ativa."
             ) from e
         try:
-            sftp = await conexao.start_sftp_client()
+            # Nome que nao e UTF-8 no servidor nao derruba a listagem e volta igual (ver nomes.py).
+            sftp = await conexao.start_sftp_client(path_errors="surrogateescape")
             # O chdir do asyncssh so resolve o caminho, nao confere se a pasta existe.
             if perfil.pasta_inicial and not await sftp.isdir(perfil.pasta_inicial):
                 conexao.close()
@@ -154,7 +196,7 @@ class GerenciadorConexoes:
         except asyncssh.Error as e:
             conexao.close()
             raise ErroConexao(f"O servidor do perfil {perfil.nome} recusou o acesso SFTP: {e}") from e
-        return _Conexao(conexao, sftp, time.monotonic(), perfil.ocioso_max_segundos)
+        return _Conexao(conexao, sftp, time.monotonic(), perfil.ocioso_max_segundos, _destino(perfil))
 
     def _descartar(self, nome: str, esperada: _Conexao | None = None) -> None:
         atual = self._conexoes.get(nome)

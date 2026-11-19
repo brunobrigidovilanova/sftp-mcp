@@ -11,7 +11,8 @@ import re
 import subprocess
 from pathlib import Path
 
-from .config import Perfil
+from . import nomes
+from .config import Perfil, diretorio_config
 
 _CARACTERES_INVALIDOS_WINDOWS = re.compile(r'[<>:"|?*\\\x00-\x1f]')
 _NOMES_RESERVADOS_WINDOWS = {
@@ -46,11 +47,21 @@ def pasta_perfil(perfil: Perfil) -> Path:
     return pasta
 
 
+def pasta_auditoria(perfil: Perfil) -> Path:
+    """Sem repositorio vinculado, a leitura audita em ~/.sftp-mcp/auditoria/<perfil>/."""
+    if perfil.repositorio and Path(perfil.repositorio).is_dir():
+        return pasta_perfil(perfil)
+    pasta = diretorio_config() / "auditoria" / perfil.nome
+    pasta.mkdir(parents=True, exist_ok=True)
+    return pasta
+
+
 def raiz_git(caminho: Path) -> Path | None:
     try:
+        # stdin desligado: herdado, o git prende o canal stdio do MCP e a tool trava.
         saida = subprocess.run(
             ["git", "-C", str(caminho), "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -62,7 +73,7 @@ def raiz_git(caminho: Path) -> Path | None:
 def ignorado_pelo_git(repositorio: Path, relativo: Path) -> bool:
     saida = subprocess.run(
         ["git", "-C", str(repositorio), "check-ignore", "-q", relativo.as_posix()],
-        capture_output=True, timeout=15,
+        capture_output=True, timeout=15, stdin=subprocess.DEVNULL,
     )
     return saida.returncode == 0
 
@@ -78,7 +89,7 @@ def aviso_git(raiz: Path, perfil: str) -> str | None:
 
 
 def _segmento_seguro(segmento: str) -> str:
-    seguro = _CARACTERES_INVALIDOS_WINDOWS.sub("_", segmento).rstrip(" .") or "_"
+    seguro = _CARACTERES_INVALIDOS_WINDOWS.sub("_", nomes.exibir(segmento)).rstrip(" .") or "_"
     if seguro.split(".")[0].upper() in _NOMES_RESERVADOS_WINDOWS:
         seguro = "_" + seguro
     return seguro
@@ -116,15 +127,33 @@ def destino_backup(perfil: Perfil, caminho_remoto: str) -> Path:
     return _reservar(_espelho(pasta_perfil(perfil) / "backups" / carimbo, caminho_remoto))
 
 
+def nova_pasta_lote(perfil: Perfil) -> Path:
+    """downloads/<data-hora>/ do lote; dois lotes no mesmo segundo ganham sufixo."""
+    base = pasta_perfil(perfil) / "downloads"
+    carimbo = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    for n in range(1, 1000):
+        pasta = base / (carimbo if n == 1 else f"{carimbo}_{n}")
+        try:
+            pasta.mkdir(parents=True)
+            return pasta
+        except FileExistsError:
+            continue
+    raise ErroRepositorio(f"Lotes demais no mesmo segundo em {base}")
+
+
+def destino_no_lote(lote: Path, relativo: str) -> Path:
+    return _reservar(_espelho(lote, relativo))
+
+
 def auditar(perfil: Perfil, operacao: str, resultado: str, **dados) -> None:
     """Uma linha JSON por operacao. Nunca recebe conteudo de arquivo nem segredo."""
-    registro = {
+    registro = nomes.sanear({
         "quando": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "perfil": perfil.nome,
         "ambiente": perfil.ambiente,
         "operacao": operacao,
         "resultado": resultado,
         **dados,
-    }
-    with (pasta_perfil(perfil) / "audit.log").open("a", encoding="utf-8") as f:
+    })
+    with (pasta_auditoria(perfil) / "audit.log").open("a", encoding="utf-8") as f:
         f.write(json.dumps(registro, ensure_ascii=False) + "\n")

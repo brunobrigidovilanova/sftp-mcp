@@ -40,6 +40,8 @@ class KeyringMemoria(KeyringBackend):
 @pytest.fixture(autouse=True)
 def isolamento(tmp_path, monkeypatch):
     monkeypatch.setenv("SFTP_MCP_HOME", str(tmp_path / "config"))
+    # Sem isso os testes leriam o FileZilla real da maquina.
+    monkeypatch.setenv("FILEZILLA_HOME", str(tmp_path / "filezilla"))
     anterior = keyring.get_keyring()
     keyring.set_keyring(KeyringMemoria())
     yield

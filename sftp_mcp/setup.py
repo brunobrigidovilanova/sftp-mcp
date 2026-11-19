@@ -1,4 +1,5 @@
-"""Cadastro de perfis SFTP pelo terminal. Senha e passphrase vao para o Credential Manager.
+"""Perfis SFTP pelo terminal. Os do FileZilla aparecem sozinhos; adicionar cria perfil proprio,
+com senha e passphrase no Credential Manager.
 
 Uso:
     sftp-mcp-setup adicionar <perfil>
@@ -18,9 +19,11 @@ import getpass
 import sys
 from pathlib import Path
 
-from . import cadastro, credenciais
+from . import cadastro, credenciais, filezilla
+from .ambiente import deduzir_ambiente
 from .config import (
-    AMBIENTES, AUTENTICACOES, ErroConfig, Perfil, carregar_perfis, obter_perfil, salvar_perfil, salvar_perfis,
+    AMBIENTES, AUTENTICACOES, ORIGEM_FILEZILLA, ErroConfig, Perfil, carregar_com_ignorados, carregar_perfis,
+    identidade, nome_segredo, obter_perfil, remover_perfil, salvar_perfil,
 )
 from .conexao import ErroConexao, GerenciadorConexoes, chave_do_servidor, fingerprint
 from .operacoes import ERROS_ESPERADOS, Operacoes
@@ -97,7 +100,7 @@ def adicionar(nome: str) -> int:
         chave_privada = str(Path(_perguntar("Caminho da chave privada (formato OpenSSH)")).expanduser())
         _validar_chave_privada(chave_privada)
     ambiente = _perguntar(
-        f"Ambiente ({'/'.join(AMBIENTES)})", cadastro.deduzir_ambiente(usuario),
+        f"Ambiente ({'/'.join(AMBIENTES)})", deduzir_ambiente(usuario),
         lambda t: None if t in AMBIENTES else f"Responda {', '.join(AMBIENTES)}.",
     )
     tspace_cliente = _perguntar("Codigo do cliente no tspace (opcional)")
@@ -122,12 +125,17 @@ def adicionar(nome: str) -> int:
 
 
 def listar() -> int:
-    perfis = carregar_perfis()
-    if not perfis:
-        print("Nenhum perfil cadastrado.")
+    perfis, ignorados = carregar_com_ignorados()
+    if not perfis and not ignorados:
+        print("Nenhum perfil cadastrado nem conexao SFTP no FileZilla.")
         return 0
     for p in perfis.values():
-        print(f"{p.nome:<24} {p.ambiente:<5} {p.usuario}@{p.host}:{p.porta}  repo={p.repositorio or '-'}")
+        print(
+            f"{p.nome:<28} {p.ambiente:<5} {p.origem:<11} {p.usuario}@{p.host}:{p.porta}  "
+            f"repo={p.repositorio or '-'}"
+        )
+    for i in ignorados:
+        print(f"{i['perfil']:<28} INDISPONIVEL ({i['origem']}): {i['motivo']}")
     return 0
 
 
@@ -149,18 +157,30 @@ def testar(nome: str) -> int:
 
 
 def remover(nome: str) -> int:
-    perfis = carregar_perfis()
-    if nome not in perfis:
+    perfil = carregar_perfis().get(nome)
+    conexao = identidade(perfil) if perfil is not None and perfil.origem == ORIGEM_FILEZILLA else None
+    if not remover_perfil(nome, conexao) and perfil is None:
         raise SystemExit(f"Perfil {nome} nao existe.")
-    del perfis[nome]
-    salvar_perfis(perfis)
-    credenciais.remover(nome)
-    print(f"Perfil {nome} e seus segredos removidos. A pasta .claude/sftp/{nome} do repositorio foi mantida.")
+    credenciais.remover(nome_segredo(perfil) if perfil is not None else nome)
+    if perfil is not None and perfil.origem == ORIGEM_FILEZILLA:
+        print(
+            f"Ajustes do perfil {nome} removidos do perfis.toml. A conexao continua no FileZilla: "
+            "para o perfil sumir, apague-a la."
+        )
+    else:
+        print(f"Perfil {nome} e seus segredos removidos.")
+    print(f"A pasta .claude/sftp/{nome} do repositorio foi mantida.")
     return 0
+
+
+def _recusar_se_filezilla(perfil: Perfil, o_que: str) -> None:
+    if perfil.origem == ORIGEM_FILEZILLA:
+        raise SystemExit(f"{o_que} do perfil {perfil.nome} vem do FileZilla: altere la, conectando por ele.")
 
 
 def trocar_fingerprint(nome: str) -> int:
     perfil = obter_perfil(nome)
+    _recusar_se_filezilla(perfil, "A chave do servidor")
     perfil.host_key = _confirmar_chave(perfil.host, perfil.porta, atual=perfil.host_key)
     salvar_perfil(perfil)
     print("Chave atualizada.")
@@ -169,9 +189,14 @@ def trocar_fingerprint(nome: str) -> int:
 
 def definir_senha(nome: str) -> int:
     perfil = obter_perfil(nome)
+    # Sem senha salva no FileZilla (pedir senha, senha mestra), o keyring serve de reserva.
+    if perfil.origem == ORIGEM_FILEZILLA and perfil.autenticacao == "senha" and filezilla.senha(
+        perfil.host, perfil.porta, perfil.usuario
+    ):
+        _recusar_se_filezilla(perfil, "A senha")
     segredo = _pedir_segredo(perfil)
     if segredo:
-        credenciais.gravar(nome, "senha" if perfil.autenticacao == "senha" else "passphrase", segredo)
+        credenciais.gravar(nome_segredo(perfil), "senha" if perfil.autenticacao == "senha" else "passphrase", segredo)
     print("Segredo gravado no Credential Manager.")
     return 0
 
@@ -207,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     try:
         return acoes[args.comando]()
-    except (ErroConfig, ErroConexao, OSError, *ERROS_ESPERADOS) as e:
+    except (ErroConfig, ErroConexao, filezilla.ErroFileZilla, OSError, *ERROS_ESPERADOS) as e:
         print(f"Erro: {e}", file=sys.stderr)
         return 1
 
